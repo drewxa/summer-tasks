@@ -7,56 +7,82 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 )
 
-func logging(s []byte) {
-	ok, hash := encode(s)
-	if ok {
-		fmt.Println(string(s) + ": " + hex.EncodeToString(hash))
+var (
+	consumersCount = 8
+	sleepTimeout   = 10 * time.Millisecond
+	endTimeout     = 100 * time.Second
+)
+
+type predicate func([]byte) bool
+
+func preparePreimage(number uint64) []byte {
+	bytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(bytes, number)
+	hash := sha256.New()
+	hash.Write(bytes)
+	return hash.Sum(nil)
+}
+
+func findHash(match predicate, numbers <-chan uint64, wait *sync.WaitGroup) {
+
+	defer wait.Done()
+	for {
+		select {
+		case number, ok := <-numbers:
+			if ok {
+				preimage := preparePreimage(number)
+				if match(preimage) {
+					fmt.Printf("%d: %s\n", number, hex.EncodeToString(preimage))
+				}
+			} else {
+				return
+			}
+		}
 	}
 }
 
-func encode(data []byte) (bool, []byte) {
-	hash := sha256.New()
-	hash.Write(data)
-	value := hash.Sum(nil)
-	return bytes.Equal(value[0:3], []byte{0, 0, 0}), value
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
-func findHash(ch <-chan uint64, timer <-chan time.Time, done chan<- bool) {
+func produceData(numbers chan<- uint64, timer <-chan time.Time, wait *sync.WaitGroup) {
+	defer wait.Done()
+	defer close(numbers)
 	for {
 		select {
 		case <-timer:
-			done <- true
 			return
 		default:
-			rnd := <-ch
-			bs := make([]byte, 8)
-			binary.LittleEndian.PutUint64(bs, rnd)
-			logging(bs)
+			numbers <- rand.Uint64()
+			time.Sleep(sleepTimeout)
 		}
 	}
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+
 	fmt.Println("starting...")
-	ch := make(chan uint64, 100)
-	timer := time.After(10 * time.Second)
-	done := make(chan bool)
-	for i := 0; i < 8; i++ {
-		go findHash(ch, timer, done)
+	defer fmt.Println("ending...")
+
+	var (
+		numbers = make(chan uint64, 100)
+		matcher = func(value []byte) bool {
+			return bytes.Equal(value[0:3], []byte{0, 0, 0})
+		}
+		timer     = time.After(endTimeout)
+		waitGroup sync.WaitGroup
+	)
+	waitGroup.Add(1)
+	go produceData(numbers, timer, &waitGroup)
+
+	waitGroup.Add(consumersCount)
+	for i := 0; i < consumersCount; i++ {
+		go findHash(matcher, numbers, &waitGroup)
 	}
 
-	for finished := false; finished != true; {
-		select {
-		case <-done:
-			finished = true
-		default:
-			ch <- rand.Uint64()
-		}
-	}
-	close(ch)
-	close(done)
+	waitGroup.Wait()
 }
